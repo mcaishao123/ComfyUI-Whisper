@@ -365,3 +365,166 @@ class WhisperTranscribeNode:
             })
 
         return (full_text, json.dumps(ts_data, ensure_ascii=False, indent=2))
+
+class AudioSplitByTimestampsNode:
+    """
+     Split audio into segments based on JSON timestamps.
+    Outputs a list of audio segments that can be connected to Save/Preview nodes.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "json_timestamps": ("STRING", {"multiline": True, "default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO",)
+    RETURN_NAMES = ("audio_segments",)
+    FUNCTION = "split_audio"
+    CATEGORY = "Whisper"
+    DESCRIPTION = "Split audio into multiple segments based on JSON timestamps. Each segment is output as a separate AUDIO."
+    OUTPUT_IS_LIST = (True,)
+
+    def split_audio(self, audio: Dict[str, Any], json_timestamps: str):
+        import json as json_lib
+
+        # Parse JSON timestamps
+        try:
+            timestamps = json_lib.loads(json_timestamps)
+        except json_lib.JSONDecodeError:
+            raise RuntimeError("Invalid JSON timestamps format")
+
+        if not isinstance(timestamps, list) or len(timestamps) == 0:
+            raise RuntimeError("Timestamps must be a non-empty JSON array")
+
+        waveform = audio["waveform"]  # [batch, channels, samples]
+        sr = audio["sample_rate"]
+
+        if waveform.dim() == 3:
+            wav = waveform[0]  # [channels, samples]
+        else:
+            wav = waveform
+
+        audio_list = []
+        for item in timestamps:
+            idx = item.get("index", 0)
+            text = item.get("text", "")
+            start = float(item.get("start", 0))
+            end = float(item.get("end", 0))
+
+            start_sample = int(start * sr)
+            end_sample = int(end * sr)
+            end_sample = min(end_sample, wav.shape[-1])
+            start_sample = max(0, start_sample)
+
+            if start_sample >= end_sample:
+                continue
+
+            segment = wav[:, start_sample:end_sample].unsqueeze(0)  # [1, channels, samples]
+            audio_list.append({"waveform": segment, "sample_rate": sr})
+            print(f"[Whisper]  Segment {idx}: [{start:.3f}s ~ {end:.3f}s] \"{text}\"")
+
+        print(f"[Whisper]  Split into {len(audio_list)} audio segments")
+        return (audio_list,)
+
+
+class WhisperOpeningSplitNode:
+    """
+     Whisper Opening Split:
+    Split audio and JSON timestamps into exactly two parts: an Opening part and a Content part,
+    based on the opening text. Subtitles for the Content part are adjusted to start at 0.0s.
+    """
+    @classmethod
+    def INPUT_TYPES(cls) -> Dict[str, Any]:
+        return {
+            "required": {
+                "audio": ("AUDIO",),
+                "whisper_json": ("STRING", {"multiline": True, "default": ""}),
+                "opening_text": ("STRING", {"multiline": True, "default": "", "placeholder": "Exact opening text, e.g. 大家好，我是..."}),
+            },
+        }
+
+    RETURN_TYPES = ("AUDIO", "STRING", "STRING", "AUDIO", "STRING", "STRING")
+    RETURN_NAMES = ("audio_opening", "json_opening", "srt_opening", "audio_content", "json_content", "srt_content")
+    FUNCTION = "split"
+    CATEGORY = "Whisper"
+
+    def split(self, audio: Dict[str, Any], whisper_json: str, opening_text: str):
+        import json as json_lib
+        
+        try:
+            timestamps = json_lib.loads(whisper_json)
+        except json_lib.JSONDecodeError:
+            raise RuntimeError("Invalid JSON timestamps format")
+
+        if not isinstance(timestamps, list) or len(timestamps) == 0:
+            raise RuntimeError("Timestamps must be a non-empty JSON array")
+            
+        def clean(t):
+            return re.sub(r'[。！？.!?，,、；;：:\-\s\u3000]', '', t)
+            
+        clean_opening = clean(opening_text)
+        if not clean_opening:
+            raise RuntimeError("Opening text is empty after removing punctuation.")
+
+        # Find the split point
+        split_time = 0.0
+        split_index = -1
+        accumulated_clean = ""
+        
+        for idx, item in enumerate(timestamps):
+            item_clean = clean(item.get("text", ""))
+            accumulated_clean += item_clean
+            # We found the segment containing the end of the opening text
+            # Or exactly equal to opening text
+            if clean_opening in accumulated_clean:
+                split_time = float(item.get("end", 0.0))
+                split_index = idx
+                break
+                
+        if split_index == -1:
+            print("[Whisper] Warning: Could not find exact match for opening text. Using full audio as content.")
+            split_time = 0.0
+            split_index = -1
+            opening_segments = []
+            content_segments = timestamps
+        else:
+            opening_segments = timestamps[:split_index + 1]
+            content_segments = timestamps[split_index + 1:]
+            
+        # Adjust timestamps for content
+        adjusted_content = []
+        for item in content_segments:
+            new_item = item.copy()
+            new_item["start"] = round(max(0.0, float(item["start"]) - split_time), 3)
+            new_item["end"] = round(max(0.0, float(item["end"]) - split_time), 3)
+            adjusted_content.append(new_item)
+            
+        # Split Audio
+        waveform = audio["waveform"]
+        sr = audio["sample_rate"]
+        
+        split_sample = int(split_time * sr)
+        end_sample = waveform.shape[-1]
+        split_sample = min(split_sample, end_sample)
+        split_sample = max(0, split_sample)
+        
+        # Audio can be 3D [batch, channels, samples] or 2D [channels, samples]
+        if waveform.dim() == 3:
+            wav_opening = waveform[:, :, :split_sample]
+            wav_content = waveform[:, :, split_sample:]
+        else:
+            wav_opening = waveform[:, :split_sample]
+            wav_content = waveform[:, split_sample:]
+            
+        audio_opening = {"waveform": wav_opening, "sample_rate": sr}
+        audio_content = {"waveform": wav_content, "sample_rate": sr}
+        
+        json_opening, srt_opening = WhisperAlignNode._format_output(opening_segments)
+        json_content, srt_content = WhisperAlignNode._format_output(adjusted_content)
+        
+        print(f"[Whisper]  Split complete. Opening ends at {split_time:.3f}s")
+        
+        return (audio_opening, json_opening, srt_opening, audio_content, json_content, srt_content)
