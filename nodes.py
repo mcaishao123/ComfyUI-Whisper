@@ -373,38 +373,62 @@ class AudioSplitByTimestampsNode:
         sr = audio["sample_rate"]
 
         if waveform.dim() == 3:
-            wav = waveform[0]  # [channels, samples]
+            wav = waveform[0]
         else:
             wav = waveform
 
         audio_list = []
-        for item in timestamps:
-            idx = item.get("index", 0)
+        n = len(timestamps)
+        
+        for i in range(n):
+            item = timestamps[i]
+            idx = item.get("index", i + 1)
             text = item.get("text", "")
-            start = float(item.get("start", 0))
-            end = float(item.get("end", 0))
-
-            start_sample = int(start * sr)
-            end_sample = int(end * sr)
+            
+            # --- Midpoint Logic ---
+            # Start: Midpoint between prev_end and current_start
+            s_val = float(item.get("start", 0))
+            if i > 0:
+                prev_e = float(timestamps[i-1].get("end", s_val))
+                actual_start = (prev_e + s_val) / 2
+            else:
+                actual_start = 0.0 # First segment starts at beginning or specified 0.0
+            
+            # End: Midpoint between current_end and next_start
+            e_val = float(item.get("end", s_val))
+            if i < n - 1:
+                next_s = float(timestamps[i+1].get("start", e_val))
+                actual_end = (e_val + next_s) / 2
+            else:
+                actual_end = wav.shape[-1] / sr # Last segment goes to end
+            
+            # Convert to samples
+            start_sample = int(actual_start * sr)
+            end_sample = int(actual_end * sr)
+            
+            # Boundary checks
             end_sample = min(end_sample, wav.shape[-1])
             start_sample = max(0, start_sample)
 
             if start_sample >= end_sample:
-                continue
+                # Fallback to exact if midpoint logic fails (e.g. overlapping data)
+                start_sample = int(s_val * sr)
+                end_sample = int(e_val * sr)
+                if start_sample >= end_sample: continue
 
-            segment = wav[:, start_sample:end_sample].unsqueeze(0)  # [1, channels, samples]
+            segment = wav[:, start_sample:end_sample].unsqueeze(0)
             audio_list.append({"waveform": segment, "sample_rate": sr})
-            print(f"[Whisper]  Segment {idx}: [{start:.3f}s ~ {end:.3f}s] \"{text}\"")
+            print(f"[Whisper] ✂️ Segment {idx} (Midpoint): [{actual_start:.3f}s ~ {actual_end:.3f}s] \"{text}\"")
 
-        print(f"[Whisper]  Split into {len(audio_list)} audio segments")
+        print(f"[Whisper] ✂️ Split into {len(audio_list)} seamless audio segments")
         return (audio_list,)
 
 
 class WhisperOpeningSplitNode:
     """
-     Whisper Opening Split:
-    Split audio and JSON timestamps into exactly two parts: an Opening part and a Content part,
-    based on the opening text. Subtitles for the Content part are adjusted to start at 0.0s.
+    ✂️ Whisper Opening Split:
+    Split audio and JSON timestamps into exactly two parts based on the midpoint of the gap 
+    between the opening and content.
     """
     @classmethod
     def INPUT_TYPES(cls) -> Dict[str, Any]:
@@ -433,38 +457,41 @@ class WhisperOpeningSplitNode:
             raise RuntimeError("Timestamps must be a non-empty JSON array")
             
         def clean(t):
-            return re.sub(r'[。！？.!?，,、；;：:\-\s\u3000]', '', t)
+            return re.sub(r'[。！？.!?，,、；;：:—…·\-\s\u3000]', '', t)
             
         clean_opening = clean(opening_text)
         if not clean_opening:
             raise RuntimeError("Opening text is empty after removing punctuation.")
 
-        # Find the split point
-        split_time = 0.0
+        # Find the split point (the last segment of the opening)
         split_index = -1
         accumulated_clean = ""
-        
         for idx, item in enumerate(timestamps):
             item_clean = clean(item.get("text", ""))
             accumulated_clean += item_clean
-            # We found the segment containing the end of the opening text
-            # Or exactly equal to opening text
             if clean_opening in accumulated_clean:
-                split_time = float(item.get("end", 0.0))
                 split_index = idx
                 break
                 
         if split_index == -1:
-            print("[Whisper] Warning: Could not find exact match for opening text. Using full audio as content.")
+            print("[Whisper] Warning: Could not find exact match for opening text. Using all as content.")
             split_time = 0.0
-            split_index = -1
             opening_segments = []
             content_segments = timestamps
         else:
             opening_segments = timestamps[:split_index + 1]
             content_segments = timestamps[split_index + 1:]
             
-        # Adjust timestamps for content
+            # --- Midpoint Logic ---
+            t_opening_end = float(opening_segments[-1].get("end", 0.0))
+            if content_segments:
+                t_content_start = float(content_segments[0].get("start", t_opening_end))
+                # Split exactly in the middle of the pause
+                split_time = (t_opening_end + t_content_start) / 2
+            else:
+                split_time = t_opening_end
+
+        # Adjust timestamps for content based on split_time
         adjusted_content = []
         for item in content_segments:
             new_item = item.copy()
@@ -472,16 +499,10 @@ class WhisperOpeningSplitNode:
             new_item["end"] = round(max(0.0, float(item["end"]) - split_time), 3)
             adjusted_content.append(new_item)
             
-        # Split Audio
         waveform = audio["waveform"]
         sr = audio["sample_rate"]
-        
         split_sample = int(split_time * sr)
-        end_sample = waveform.shape[-1]
-        split_sample = min(split_sample, end_sample)
-        split_sample = max(0, split_sample)
         
-        # Audio can be 3D [batch, channels, samples] or 2D [channels, samples]
         if waveform.dim() == 3:
             wav_opening = waveform[:, :, :split_sample]
             wav_content = waveform[:, :, split_sample:]
@@ -495,6 +516,5 @@ class WhisperOpeningSplitNode:
         json_opening, srt_opening = WhisperAlignNode._format_output(opening_segments)
         json_content, srt_content = WhisperAlignNode._format_output(adjusted_content)
         
-        print(f"[Whisper]  Split complete. Opening ends at {split_time:.3f}s")
-        
+        print(f"[Whisper] ✂️ Midpoint Split complete. Gap cut at {split_time:.3f}s")
         return (audio_opening, json_opening, srt_opening, audio_content, json_content, srt_content)
