@@ -80,13 +80,11 @@ class WhisperAlignNode:
         waveform = audio["waveform"]
         sr = audio["sample_rate"]
 
-        # Convert to numpy float32 mono
         if waveform.dim() == 3:
-            wav = waveform[0]  # [channels, samples]
+            wav = waveform[0]
         else:
             wav = waveform
 
-        # Convert to mono if stereo
         if wav.shape[0] > 1:
             wav = wav.mean(dim=0)
         else:
@@ -94,19 +92,15 @@ class WhisperAlignNode:
 
         wav_np = wav.cpu().numpy()
 
-        # Resample to 16kHz if needed (Whisper requires 16kHz)
         if sr != 16000:
             import torchaudio
             wav_16k = torchaudio.functional.resample(
                 torch.from_numpy(wav_np).unsqueeze(0), sr, 16000
             )
             wav_np = wav_16k[0].numpy()
-            print(f"[Whisper] Resampled from {sr}Hz to 16000Hz")
 
-        # Load Whisper pipeline
         pipe = _get_whisper_pipeline(model_size, device, language)
 
-        # Transcribe with word-level timestamps
         print(f"[Whisper] Transcribing audio ({len(wav_np)/16000:.1f}s) with word-level timestamps...")
         result = pipe(
             wav_np,
@@ -115,70 +109,43 @@ class WhisperAlignNode:
         )
 
         whisper_chunks = result.get("chunks", [])
-        print(f"[Whisper] Got {len(whisper_chunks)} word chunks from Whisper")
-
         if not whisper_chunks:
-            raise RuntimeError("Whisper did not produce any word-level results. Try a different model size.")
+            raise RuntimeError("Whisper did not produce any word-level results.")
 
-        # --- Align Whisper words to original text ---
         subtitle_segments = self._align_words_to_text(text, whisper_chunks)
-
-        # --- Format output ---
         json_str, srt_str = self._format_output(subtitle_segments)
 
         return (json_str, srt_str)
 
     def _align_words_to_text(self, original_text: str, whisper_chunks: List[Dict]) -> List[Dict]:
-        """
-        Align Whisper's word-level timestamps to the original text.
-
-        Strategy:
-        1. Split original text by punctuation into subtitle segments
-        2. Clean both Whisper words and original text (remove punctuation)
-        3. Walk through Whisper words and match them to each segment
-        4. Map start/end timestamps from matched words to each segment
-        """
-        # Split original text into subtitle segments by all punctuation
-        segments = re.split(r'(?<=[。！？.!?，,、；;：:—…])\s*', original_text)
-        segments = [s.strip() for s in segments if s.strip()]
-
-        if not segments:
-            segments = [original_text]
-
-        # Clean function: remove all punctuation and whitespace
         def clean(t):
             return re.sub(r'[。！？.!?，,、；;：:—…·\-\s\u3000]', '', t)
 
-        # Build a flat list of clean characters from original text with segment indices
-        seg_char_map = []  # [(char, seg_index), ...]
+        segments = re.split(r'(?<=[。！？.!?，,、；;：:—…])\s*', original_text)
+        segments = [s.strip() for s in segments if s.strip()]
+        if not segments: segments = [original_text]
+
+        seg_char_map = []
         for seg_idx, seg in enumerate(segments):
             for ch in clean(seg):
                 seg_char_map.append((ch, seg_idx))
 
-        # Build a flat list of whisper chars with their timestamps
-        whisper_chars = []  # [(char, start_time, end_time), ...]
+        whisper_chars = []
         for chunk in whisper_chunks:
             chunk_text = clean(chunk.get("text", ""))
             ts = chunk.get("timestamp", (None, None))
             start_t = ts[0] if ts[0] is not None else 0.0
             end_t = ts[1] if ts[1] is not None else start_t
 
-            if not chunk_text:
-                continue
-
-            # Distribute timestamp evenly across characters in this word
+            if not chunk_text: continue
             char_dur = (end_t - start_t) / len(chunk_text) if len(chunk_text) > 0 else 0
             for i, ch in enumerate(chunk_text):
                 whisper_chars.append((ch, start_t + i * char_dur, start_t + (i + 1) * char_dur))
 
-        # --- Character-level alignment using simple sequential matching ---
+        # Greedy Character Matching
         n_orig = len(seg_char_map)
         n_whsp = len(whisper_chars)
-
-        # Map each original character to its best matching whisper character
-        # Using greedy sequential matching
-        seg_timestamps = {}  # seg_index -> (first_start, last_end)
-
+        seg_timestamps = {}
         orig_idx = 0
         whsp_idx = 0
 
@@ -187,108 +154,111 @@ class WhisperAlignNode:
             whsp_char, w_start, w_end = whisper_chars[whsp_idx]
 
             if orig_char == whsp_char:
-                # Match found
                 if seg_idx not in seg_timestamps:
                     seg_timestamps[seg_idx] = [w_start, w_end]
                 else:
-                    seg_timestamps[seg_idx][1] = w_end
+                    seg_timestamps[seg_idx][1] = max(seg_timestamps[seg_idx][1], w_end)
                 orig_idx += 1
                 whsp_idx += 1
             else:
-                # Try to find match by advancing whisper (skip extra whisper chars)
                 found = False
-                for look_ahead in range(1, min(5, n_whsp - whsp_idx)):
+                for look_ahead in range(1, min(10, n_whsp - whsp_idx)):
                     if whisper_chars[whsp_idx + look_ahead][0] == orig_char:
                         whsp_idx += look_ahead
-                        found = True
-                        break
-
+                        found = True; break
                 if not found:
-                    # Try advancing original (skip unmatched original chars)
-                    for look_ahead in range(1, min(5, n_orig - orig_idx)):
+                    for look_ahead in range(1, min(10, n_orig - orig_idx)):
                         if seg_char_map[orig_idx + look_ahead][0] == whisper_chars[whsp_idx][0]:
                             orig_idx += look_ahead
-                            found = True
-                            break
-
+                            found = True; break
                 if not found:
-                    # Skip both
-                    orig_idx += 1
-                    whsp_idx += 1
+                    orig_idx += 1; whsp_idx += 1
 
-        # Build results
         results = []
         for seg_idx, seg_text in enumerate(segments):
-            clean_text = clean(seg_text)
-            if not clean_text:
-                continue
-
+            if not clean(seg_text): continue
             if seg_idx in seg_timestamps:
-                start, end = seg_timestamps[seg_idx]
-                results.append({
-                    "text": clean_text,
-                    "start": round(start, 3),
-                    "end": round(end, 3)
-                })
+                s, e = seg_timestamps[seg_idx]
+                results.append({"text": seg_text, "start": round(s, 3), "end": round(max(s, e), 3)})
             else:
-                # Fallback: interpolate from neighbors
-                results.append({
-                    "text": clean_text,
-                    "start": 0.0,
-                    "end": 0.0
-                })
+                results.append({"text": seg_text, "start": -1.0, "end": -1.0})
 
-        # Fix any gaps or overlaps: ensure timestamps are monotonically increasing
-        for i in range(1, len(results)):
-            if results[i]["start"] < results[i-1]["end"]:
-                mid = (results[i]["start"] + results[i-1]["end"]) / 2
-                results[i-1]["end"] = round(mid, 3)
-                results[i]["start"] = round(mid, 3)
+        # --- Interpolation & Monotonicity ---
+        n_res = len(results)
+        if n_res == 0: return []
 
-        # Fill in zero-timestamp segments by interpolation
-        for i, r in enumerate(results):
-            if r["start"] == 0.0 and r["end"] == 0.0 and i > 0:
-                r["start"] = results[i-1]["end"]
-                if i + 1 < len(results):
-                    r["end"] = results[i+1]["start"]
-                else:
-                    r["end"] = r["start"] + 0.5  # fallback
+        # Boundaries
+        if results[0]["start"] < 0:
+            results[0]["start"] = 0.0
+            results[0]["end"] = 0.0
+        
+        last_audio_time = whisper_chars[-1][2] if whisper_chars else 0.0
+        if results[-1]["end"] < 0:
+            results[-1]["end"] = last_audio_time
+            results[-1]["start"] = last_audio_time
+
+        # Ensure non-decreasing
+        for i in range(n_res):
+            if i > 0 and results[i]["start"] < results[i-1]["end"] and results[i]["start"] >= 0:
+                results[i]["start"] = results[i-1]["end"]
+                if results[i]["end"] < results[i]["start"] and results[i]["end"] >= 0:
+                    results[i]["end"] = results[i]["start"]
+            
+            if results[i]["start"] >= 0 and results[i]["end"] < 0:
+                for j in range(i + 1, n_res):
+                    if results[j]["start"] >= 0:
+                        results[i]["end"] = results[j]["start"]; break
+                if results[i]["end"] < 0: results[i]["end"] = results[i]["start"]
+
+        # Proportional Fill Gaps
+        idx = 0
+        while idx < n_res:
+            # Check if this segment or sequence of segments are "point" markers (interpolation gaps)
+            if results[idx]["start"] == results[idx]["end"]:
+                gap_start_idx = idx
+                gap_end_idx = idx
+                while gap_end_idx < n_res and results[gap_end_idx]["start"] == results[gap_end_idx]["end"]:
+                    gap_end_idx += 1
+                
+                # Gap is between results[gap_start_idx-1]["end"] and results[gap_end_idx]["start"]
+                t_start = results[gap_start_idx-1]["end"] if gap_start_idx > 0 else 0.0
+                t_end = last_audio_time
+                if gap_end_idx < n_res:
+                    t_end = results[gap_end_idx]["start"]
+                
+                if t_end > t_start:
+                    gap_segs = results[gap_start_idx : gap_end_idx]
+                    total_chars = sum(len(clean(r["text"])) for r in gap_segs)
+                    if total_chars > 0:
+                        dur = t_end - t_start
+                        curr = t_start
+                        for r in gap_segs:
+                            step = (len(clean(r["text"])) / total_chars) * dur
+                            r["start"] = round(curr, 3)
+                            r["end"] = round(curr + step, 3)
+                            curr += step
+                idx = gap_end_idx
+            else:
+                idx += 1
 
         return results
 
     @staticmethod
     def _format_output(segments: List[Dict]) -> Tuple[str, str]:
-        """Format segments into JSON and SRT strings."""
         subtitles = []
         for idx, item in enumerate(segments, 1):
-            subtitles.append({
-                "index": idx,
-                "text": item["text"],
-                "start": item["start"],
-                "end": item["end"]
-            })
-
-        # JSON
+            subtitles.append({"index": idx, "text": item["text"], "start": item["start"], "end": item["end"]})
         json_str = json.dumps(subtitles, ensure_ascii=False, indent=2)
 
-        # SRT
         def _srt_time(s):
-            h = int(s // 3600)
-            m = int((s % 3600) // 60)
-            sec = int(s % 60)
+            h, m, sec = int(s // 3600), int((s % 3600) // 60), int(s % 60)
             ms = int(round((s - int(s)) * 1000))
             return f"{h:02d}:{m:02d}:{sec:02d},{ms:03d}"
 
         srt_lines = []
         for sub in subtitles:
-            srt_lines.append(str(sub["index"]))
-            srt_lines.append(f"{_srt_time(sub['start'])} --> {_srt_time(sub['end'])}")
-            srt_lines.append(sub["text"])
-            srt_lines.append("")
-
-        srt_str = "\n".join(srt_lines)
-
-        return (json_str, srt_str)
+            srt_lines.extend([str(sub["index"]), f"{_srt_time(sub['start'])} --> {_srt_time(sub['end'])}", sub["text"], ""])
+        return json_str, "\n".join(srt_lines)
 
 
 class WhisperTranscribeNode:
