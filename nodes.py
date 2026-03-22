@@ -176,12 +176,13 @@ class WhisperAlignNode:
 
         results = []
         for seg_idx, seg_text in enumerate(segments):
-            if not clean(seg_text): continue
+            clean_text_val = clean(seg_text)
+            if not clean_text_val: continue
             if seg_idx in seg_timestamps:
                 s, e = seg_timestamps[seg_idx]
-                results.append({"text": seg_text, "start": round(s, 3), "end": round(max(s, e), 3)})
+                results.append({"text": clean_text_val, "start": round(s, 3), "end": round(max(s, e), 3)})
             else:
-                results.append({"text": seg_text, "start": -1.0, "end": -1.0})
+                results.append({"text": clean_text_val, "start": -1.0, "end": -1.0})
 
         # --- Interpolation & Monotonicity ---
         n_res = len(results)
