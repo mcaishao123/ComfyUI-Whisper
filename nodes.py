@@ -113,9 +113,75 @@ class WhisperAlignNode:
             raise RuntimeError("Whisper did not produce any word-level results.")
 
         subtitle_segments = self._align_words_to_text(text, whisper_chunks)
-        json_str, srt_str = self._format_output(subtitle_segments)
+        
+        # --- RMS Energy Refinement ---
+        try:
+            subtitle_segments = self._refine_with_energy(wav_np, 16000, subtitle_segments)
+        except Exception as e:
+            print(f"[Whisper] Warning: RMS refinement failed: {e}")
 
+        json_str, srt_str = self._format_output(subtitle_segments)
         return (json_str, srt_str)
+
+    def _refine_with_energy(self, wav: Any, sr: int, segments: List[Dict]) -> List[Dict]:
+        """Refine boundaries by snapping to silence using RMS energy."""
+        import numpy as np
+        
+        # 1. Compute RMS energy in 10ms windows
+        win_size = int(sr * 0.02) # 20ms
+        hop_size = int(sr * 0.01) # 10ms
+        
+        # Simple RMS calculation
+        n_frames = (len(wav) - win_size) // hop_size + 1
+        rms = np.zeros(n_frames)
+        for i in range(n_frames):
+            start = i * hop_size
+            chunk = wav[start : start + win_size]
+            rms[i] = np.sqrt(np.mean(chunk**2))
+            
+        # Threshold: 10% of median non-zero energy or a small floor
+        threshold = np.percentile(rms[rms > 0], 20) if np.any(rms > 0) else 0.001
+        threshold = max(threshold, 0.002)
+
+        def is_voiced(t):
+            frame_idx = int(t * sr / hop_size)
+            if frame_idx < 0 or frame_idx >= len(rms): return False
+            return rms[frame_idx] > threshold
+
+        # 2. Refine Boundaries
+        refined = []
+        for i, seg in enumerate(segments):
+            s, e = seg["start"], seg["end"]
+            
+            # Snap END forward: if still voiced at 'e', look forward up to 0.4s
+            if is_voiced(e):
+                for delta in np.arange(0.01, 0.4, 0.01):
+                    if not is_voiced(e + delta):
+                        e += delta
+                        break
+                    if i + 1 < len(segments) and (e + delta) >= segments[i+1]["start"]:
+                        break # Don't overlap next segment
+            else:
+                # Snap END backward: if silence at 'e', look back up to 0.2s
+                for delta in np.arange(0.01, 0.2, 0.01):
+                    if is_voiced(e - delta):
+                        e -= (delta - 0.01) # Stay just after voice
+                        break
+
+            # Snap START backward: if voiced at 's', look back up to 0.2s
+            if is_voiced(s):
+                for delta in np.arange(0.01, 0.2, 0.01):
+                    if not is_voiced(s - delta):
+                        s -= delta
+                        break
+                    if i > 0 and (s - delta) <= segments[i-1]["end"]:
+                        break
+            
+            seg["start"], seg["end"] = round(s, 3), round(e, 3)
+            refined.append(seg)
+            
+        return refined
+
 
     def _align_words_to_text(self, original_text: str, whisper_chunks: List[Dict]) -> List[Dict]:
         import difflib
@@ -524,3 +590,49 @@ class WhisperOpeningSplitNode:
         
         print(f"[Whisper] ✂️ Midpoint Split complete. Gap cut at {split_time:.3f}s")
         return (audio_opening, json_opening, srt_opening, audio_content, json_content, srt_content)
+
+class WhisperSaveSubtitlesNode:
+    """
+     Whisper Save Subtitles:
+    Saves subtitle strings (SRT, JSON, etc.) to a file. 
+    Bypasses rigid path security checks from other node suites.
+    """
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "text": ("STRING", {"forceInput": True}),
+                "output_dir": ("STRING", {"default": "subtitles"}),
+                "filename": ("STRING", {"default": "captions.srt"}),
+                "add_timestamp": ("BOOLEAN", {"default": True}),
+            }
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("filepath",)
+    FUNCTION = "save"
+    CATEGORY = "Whisper"
+    OUTPUT_NODE = True
+
+    def save(self, text, output_dir, filename, add_timestamp):
+        import time
+        
+        # Get base output directory
+        base_output = folder_paths.get_output_directory()
+        full_dir = os.path.abspath(os.path.join(base_output, output_dir))
+        
+        if not os.path.exists(full_dir):
+            os.makedirs(full_dir, exist_ok=True)
+            
+        name, ext = os.path.splitext(filename)
+        if add_timestamp:
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            filename = f"{name}_{ts}{ext}"
+            
+        file_path = os.path.join(full_dir, filename)
+        
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(text)
+            
+        print(f"[Whisper]  Subtitles saved to: {file_path}")
+        return (file_path,)

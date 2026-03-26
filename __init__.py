@@ -6,6 +6,7 @@ from .nodes import (
     WhisperTranscribeNode,
     AudioSplitByTimestampsNode,
     WhisperOpeningSplitNode,
+    WhisperSaveSubtitlesNode,
 )
 
 NODE_CLASS_MAPPINGS = {
@@ -13,6 +14,7 @@ NODE_CLASS_MAPPINGS = {
     "WhisperTranscribe": WhisperTranscribeNode,
     "WhisperAudioSplit": AudioSplitByTimestampsNode,
     "WhisperOpeningSplit": WhisperOpeningSplitNode,
+    "WhisperSaveSubtitles": WhisperSaveSubtitlesNode,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -20,6 +22,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "WhisperTranscribe": "🎤 Whisper Transcribe",
     "WhisperAudioSplit": "✂️ Whisper Audio Split",
     "WhisperOpeningSplit": "✂️ Whisper Opening Split",
+    "WhisperSaveSubtitles": "💾 Whisper Save Subtitles",
 }
 
 __version__ = "1.0.0"
