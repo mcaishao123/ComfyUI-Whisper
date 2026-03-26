@@ -155,27 +155,33 @@ class WhisperAlignNode:
             
             # Snap END forward: if still voiced at 'e', look forward up to 0.4s
             if is_voiced(e):
+                furthest_v = e
                 for delta in np.arange(0.01, 0.4, 0.01):
-                    if not is_voiced(e + delta):
-                        e += delta
-                        break
+                    if is_voiced(e + delta):
+                        furthest_v = e + delta
+                    else:
+                        break # Found silence
                     if i + 1 < len(segments) and (e + delta) >= segments[i+1]["start"]:
-                        break # Don't overlap next segment
+                        break
+                e = furthest_v
             else:
                 # Snap END backward: if silence at 'e', look back up to 0.2s
                 for delta in np.arange(0.01, 0.2, 0.01):
                     if is_voiced(e - delta):
-                        e -= (delta - 0.01) # Stay just after voice
+                        e = e - delta + 0.01
                         break
 
             # Snap START backward: if voiced at 's', look back up to 0.2s
             if is_voiced(s):
+                furthest_v = s
                 for delta in np.arange(0.01, 0.2, 0.01):
-                    if not is_voiced(s - delta):
-                        s -= delta
+                    if is_voiced(s - delta):
+                        furthest_v = s - delta
+                    else:
                         break
                     if i > 0 and (s - delta) <= segments[i-1]["end"]:
                         break
+                s = furthest_v
             
             seg["start"], seg["end"] = round(s, 3), round(e, 3)
             refined.append(seg)
