@@ -140,8 +140,9 @@ class WhisperAlignNode:
             rms[i] = np.sqrt(np.mean(chunk**2))
             
         # Threshold: 10% of median non-zero energy or a small floor
-        threshold = np.percentile(rms[rms > 0], 20) if np.any(rms > 0) else 0.001
-        threshold = max(threshold, 0.002)
+        # Increased floor to 0.005 to better ignore background noise
+        threshold = np.percentile(rms[rms > 0], 30) if np.any(rms > 0) else 0.005
+        threshold = max(threshold, 0.005)
 
         def is_voiced(t):
             frame_idx = int(t * sr / hop_size)
@@ -153,10 +154,10 @@ class WhisperAlignNode:
         for i, seg in enumerate(segments):
             s, e = seg["start"], seg["end"]
             
-            # Snap END forward: if still voiced at 'e', look forward up to 0.4s
+            # Snap END forward: if still voiced at 'e', look forward up to 0.5s
             if is_voiced(e):
                 furthest_v = e
-                for delta in np.arange(0.01, 0.4, 0.01):
+                for delta in np.arange(0.01, 0.5, 0.01):
                     if is_voiced(e + delta):
                         furthest_v = e + delta
                     else:
@@ -165,16 +166,16 @@ class WhisperAlignNode:
                         break
                 e = furthest_v
             else:
-                # Snap END backward: if silence at 'e', look back up to 0.2s
-                for delta in np.arange(0.01, 0.2, 0.01):
+                # Snap END backward: if silence at 'e', look back up to 0.3s
+                for delta in np.arange(0.01, 0.3, 0.01):
                     if is_voiced(e - delta):
-                        e = e - delta + 0.01
+                        e = e - delta + 0.02 # Add tiny safety margin
                         break
 
-            # Snap START backward: if voiced at 's', look back up to 0.2s
+            # Snap START backward: if voiced at 's', look back up to 0.3s
             if is_voiced(s):
                 furthest_v = s
-                for delta in np.arange(0.01, 0.2, 0.01):
+                for delta in np.arange(0.01, 0.3, 0.01):
                     if is_voiced(s - delta):
                         furthest_v = s - delta
                     else:
@@ -338,6 +339,23 @@ class WhisperAlignNode:
             srt_lines.extend([str(sub["index"]), f"{_srt_time(sub['start'])} --> {_srt_time(sub['end'])}", sub["text"], ""])
         return json_str, "\n".join(srt_lines)
 
+    @staticmethod
+    def _apply_fade(waveform: torch.Tensor, sr: int, fade_ms: int = 50) -> torch.Tensor:
+        """Apply a micro-fade in/out to prevent clicks and trailing noise."""
+        fade_samples = int(sr * fade_ms / 1000)
+        if waveform.shape[-1] < 2 * fade_samples:
+            return waveform
+            
+        # Linear fade
+        fade_in = torch.linspace(0.0, 1.0, fade_samples, device=waveform.device)
+        fade_out = torch.linspace(1.0, 0.0, fade_samples, device=waveform.device)
+        
+        # Clone to avoid in-place modification of shared buffers if any
+        wav = waveform.clone()
+        wav[..., :fade_samples] *= fade_in
+        wav[..., -fade_samples:] *= fade_out
+        return wav
+
 
 class WhisperTranscribeNode:
     """
@@ -495,8 +513,11 @@ class AudioSplitByTimestampsNode:
                 if start_sample >= end_sample: continue
 
             segment = wav[:, start_sample:end_sample].unsqueeze(0)
+            # Apply Micro-fade
+            segment = WhisperAlignNode._apply_fade(segment, sr, 50)
+            
             audio_list.append({"waveform": segment, "sample_rate": sr})
-            print(f"[Whisper] ✂️ Segment {idx} (Midpoint): [{actual_start:.3f}s ~ {actual_end:.3f}s] \"{text}\"")
+            print(f"[Whisper] ✂️ Segment {idx} (Midpoint + Fade): [{actual_start:.3f}s ~ {actual_end:.3f}s] \"{text}\"")
 
         print(f"[Whisper] ✂️ Split into {len(audio_list)} seamless audio segments")
         return (audio_list,)
@@ -584,10 +605,16 @@ class WhisperOpeningSplitNode:
         if waveform.dim() == 3:
             wav_opening = waveform[:, :, :split_sample]
             wav_content = waveform[:, :, split_sample:]
+            waveform_v = waveform # [batch, channels, samples]
         else:
             wav_opening = waveform[:, :split_sample]
             wav_content = waveform[:, split_sample:]
-            
+            waveform_v = waveform.unsqueeze(0)
+
+        # Apply Fades
+        wav_opening = WhisperAlignNode._apply_fade(wav_opening, sr, 50)
+        wav_content = WhisperAlignNode._apply_fade(wav_content, sr, 50)
+
         audio_opening = {"waveform": wav_opening, "sample_rate": sr}
         audio_content = {"waveform": wav_content, "sample_rate": sr}
         
