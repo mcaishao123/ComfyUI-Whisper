@@ -118,6 +118,8 @@ class WhisperAlignNode:
         return (json_str, srt_str)
 
     def _align_words_to_text(self, original_text: str, whisper_chunks: List[Dict]) -> List[Dict]:
+        import difflib
+        
         def clean(t):
             return re.sub(r'[。！？.!?，,、；;：:—…·\-\s\u3000]', '', t)
 
@@ -125,80 +127,82 @@ class WhisperAlignNode:
         segments = [s.strip() for s in segments if s.strip()]
         if not segments: segments = [original_text]
 
-        seg_char_map = []
-        for seg_idx, seg in enumerate(segments):
-            for ch in clean(seg):
-                seg_char_map.append((ch, seg_idx))
-
-        whisper_chars = []
-        for chunk in whisper_chunks:
-            chunk_text = clean(chunk.get("text", ""))
+        # 1. Prepare original characters with segment info
+        orig_chars = []
+        for i, seg in enumerate(segments):
+            for c in clean(seg):
+                orig_chars.append({"char": c, "seg_idx": i})
+        
+        # 2. Extract Whisper characters with refined timestamps
+        whsp_chars = []
+        for i, chunk in enumerate(whisper_chunks):
+            text = clean(chunk.get("text", ""))
+            if not text: continue
+            
             ts = chunk.get("timestamp", (None, None))
-            start_t = ts[0] if ts[0] is not None else 0.0
-            end_t = ts[1] if ts[1] is not None else start_t
-
-            if not chunk_text: continue
-            char_dur = (end_t - start_t) / len(chunk_text) if len(chunk_text) > 0 else 0
-            for i, ch in enumerate(chunk_text):
-                whisper_chars.append((ch, start_t + i * char_dur, start_t + (i + 1) * char_dur))
-
-        # Greedy Character Matching
-        n_orig = len(seg_char_map)
-        n_whsp = len(whisper_chars)
-        seg_timestamps = {}
-        orig_idx = 0
-        whsp_idx = 0
-
-        while orig_idx < n_orig and whsp_idx < n_whsp:
-            orig_char, seg_idx = seg_char_map[orig_idx]
-            whsp_char, w_start, w_end = whisper_chars[whsp_idx]
-
-            if orig_char == whsp_char:
-                if seg_idx not in seg_timestamps:
-                    seg_timestamps[seg_idx] = [w_start, w_end]
+            start_t = ts[0] if ts[0] is not None else (whsp_chars[-1]["end"] if whsp_chars else 0.0)
+            
+            # Refine end time: if missing, use next start or small offset
+            end_t = ts[1]
+            if end_t is None:
+                if i + 1 < len(whisper_chunks):
+                    next_ts = whisper_chunks[i+1].get("timestamp", (None, None))
+                    end_t = next_ts[0] if next_ts[0] is not None else (start_t + 0.2)
                 else:
-                    seg_timestamps[seg_idx][1] = max(seg_timestamps[seg_idx][1], w_end)
-                orig_idx += 1
-                whsp_idx += 1
-            else:
-                found = False
-                for look_ahead in range(1, min(10, n_whsp - whsp_idx)):
-                    if whisper_chars[whsp_idx + look_ahead][0] == orig_char:
-                        whsp_idx += look_ahead
-                        found = True; break
-                if not found:
-                    for look_ahead in range(1, min(10, n_orig - orig_idx)):
-                        if seg_char_map[orig_idx + look_ahead][0] == whisper_chars[whsp_idx][0]:
-                            orig_idx += look_ahead
-                            found = True; break
-                if not found:
-                    orig_idx += 1; whsp_idx += 1
+                    end_t = start_t + 0.2
+            
+            if end_t <= start_t: end_t = start_t + 0.1
+            
+            char_dur = (end_t - start_t) / len(text)
+            for j, c in enumerate(text):
+                whsp_chars.append({"char": c, "start": start_t + j * char_dur, "end": start_t + (j + 1) * char_dur})
 
+        # 3. Robust Sequence Alignment
+        matcher = difflib.SequenceMatcher(None, [x["char"] for x in orig_chars], [x["char"] for x in whsp_chars])
+        
+        # Map segment index to list of matched timestamps
+        seg_times = {i: [] for i in range(len(segments))}
+        for tag, i1, i2, j1, j2 in matcher.get_opcodes():
+            if tag == 'equal':
+                for k in range(i2 - i1):
+                    o_idx = i1 + k
+                    w_idx = j1 + k
+                    s_idx = orig_chars[o_idx]["seg_idx"]
+                    seg_times[s_idx].append(whsp_chars[w_idx]["start"])
+                    seg_times[s_idx].append(whsp_chars[w_idx]["end"])
+
+        # 4. Initial Results Building
         results = []
-        for seg_idx, seg_text in enumerate(segments):
-            clean_text_val = clean(seg_text)
-            if not clean_text_val: continue
-            if seg_idx in seg_timestamps:
-                s, e = seg_timestamps[seg_idx]
-                results.append({"text": clean_text_val, "start": round(s, 3), "end": round(max(s, e), 3)})
+        last_matched_end = 0.0
+        for i, seg_text in enumerate(segments):
+            clean_text = clean(seg_text)
+            if not clean_text: continue
+            
+            times = sorted(seg_times[i])
+            if times:
+                s, e = times[0], times[-1]
+                # Duration heuristic: force minimum 0.1s per character
+                # This prevents "teleporting" if Whisper matched words too closely
+                min_dur = len(clean_text) * 0.1
+                if (e - s) < min_dur:
+                    e = s + min_dur
+                
+                results.append({"text": clean_text, "start": round(s, 3), "end": round(e, 3)})
+                last_matched_end = e
             else:
-                results.append({"text": clean_text_val, "start": -1.0, "end": -1.0})
+                # Unmatched: placeholder
+                results.append({"text": clean_text, "start": -1.0, "end": -1.0})
 
-        # --- Interpolation & Monotonicity ---
+        # 5. Global Interpolation & Non-decreasing constraint
         n_res = len(results)
         if n_res == 0: return []
 
         # Boundaries
-        if results[0]["start"] < 0:
-            results[0]["start"] = 0.0
-            results[0]["end"] = 0.0
-        
-        last_audio_time = whisper_chars[-1][2] if whisper_chars else 0.0
-        if results[-1]["end"] < 0:
-            results[-1]["end"] = last_audio_time
-            results[-1]["start"] = last_audio_time
+        total_audio_dur = whsp_chars[-1]["end"] if whsp_chars else 0.0
+        if results[0]["start"] < 0: results[0]["start"] = 0.0; results[0]["end"] = 0.0
+        if results[-1]["end"] < 0: results[-1]["start"] = total_audio_dur; results[-1]["end"] = total_audio_dur
 
-        # Ensure non-decreasing
+        # Forward pass: ensure no overlaps AND non-negative
         for i in range(n_res):
             if i > 0 and results[i]["start"] < results[i-1]["end"] and results[i]["start"] >= 0:
                 results[i]["start"] = results[i-1]["end"]
@@ -206,41 +210,42 @@ class WhisperAlignNode:
                     results[i]["end"] = results[i]["start"]
             
             if results[i]["start"] >= 0 and results[i]["end"] < 0:
-                for j in range(i + 1, n_res):
+                # Find next known
+                for j in range(i+1, n_res):
                     if results[j]["start"] >= 0:
                         results[i]["end"] = results[j]["start"]; break
                 if results[i]["end"] < 0: results[i]["end"] = results[i]["start"]
 
-        # Proportional Fill Gaps
+        # Proportional GAP Filling (Final smoothing)
         idx = 0
         while idx < n_res:
-            # Check if this segment or sequence of segments are "point" markers (interpolation gaps)
             if results[idx]["start"] == results[idx]["end"]:
                 gap_start_idx = idx
-                gap_end_idx = idx
-                while gap_end_idx < n_res and results[gap_end_idx]["start"] == results[gap_end_idx]["end"]:
-                    gap_end_idx += 1
+                while idx < n_res and results[idx]["start"] == results[idx]["end"]:
+                    idx += 1
                 
-                # Gap is between results[gap_start_idx-1]["end"] and results[gap_end_idx]["start"]
                 t_start = results[gap_start_idx-1]["end"] if gap_start_idx > 0 else 0.0
-                t_end = last_audio_time
-                if gap_end_idx < n_res:
-                    t_end = results[gap_end_idx]["start"]
+                t_end = total_audio_dur 
+                if idx < n_res: t_end = results[idx]["start"]
                 
                 if t_end > t_start:
-                    gap_segs = results[gap_start_idx : gap_end_idx]
-                    total_chars = sum(len(clean(r["text"])) for r in gap_segs)
-                    if total_chars > 0:
-                        dur = t_end - t_start
-                        curr = t_start
-                        for r in gap_segs:
-                            step = (len(clean(r["text"])) / total_chars) * dur
-                            r["start"] = round(curr, 3)
-                            r["end"] = round(curr + step, 3)
-                            curr += step
-                idx = gap_end_idx
+                    gap_segs = results[gap_start_idx : idx]
+                    total_c = sum(len(clean(r["text"])) for r in gap_segs)
+                    curr = t_start
+                    for r in gap_segs:
+                        step = (len(clean(r["text"])) / total_c) * (t_end - t_start)
+                        r["start"] = round(curr, 3); r["end"] = round(curr + step, 3)
+                        curr += step
             else:
                 idx += 1
+        
+        # Bridge small gaps between sentences to make it look like a Continuous stream
+        # (Optional: Only if gap is < 0.5s)
+        for i in range(1, n_res):
+            gap = results[i]["start"] - results[i-1]["end"]
+            if 0 < gap < 0.3:
+                results[i-1]["end"] = (results[i-1]["end"] + results[i]["start"]) / 2
+                results[i]["start"] = results[i-1]["end"]
 
         return results
 
