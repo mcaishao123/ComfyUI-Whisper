@@ -144,55 +144,11 @@ class WhisperAlignNode:
         threshold = np.percentile(rms[rms > 0], 30) if np.any(rms > 0) else 0.005
         threshold = max(threshold, 0.005)
 
-        def is_voiced(t):
-            frame_idx = int(t * sr / hop_size)
-            if frame_idx < 0 or frame_idx >= len(rms): return False
-            return rms[frame_idx] > threshold
-
-        # 2. Refine Boundaries with tight snapping
-        refined = []
-        for i, seg in enumerate(segments):
-            s, e = seg["start"], seg["end"]
-            
-            # Snap END forward: only if very clear voice
-            if is_voiced(e):
-                furthest_v = e
-                for delta in np.arange(0.01, 0.4, 0.01):
-                    if is_voiced(e + delta):
-                        furthest_v = e + delta
-                    else:
-                        break # Silence found
-                    # Safe check for overlap
-                    if i + 1 < len(segments) and segments[i+1]["start"] >= 0:
-                        if (e + delta) >= segments[i+1]["start"]: break
-                e = furthest_v
-            else:
-                # Snap END backward: trim silence more aggressively
-                for delta in np.arange(0.01, 0.3, 0.01):
-                    if is_voiced(e - delta):
-                        e = e - delta + 0.01
-                        break
-
-            # Snap START: usually Whisper is good at start, but let's be safe
-            if is_voiced(s):
-                furthest_v = s
-                for delta in np.arange(0.01, 0.2, 0.01):
-                    if is_voiced(s - delta):
-                        furthest_v = s - delta
-                    else:
-                        break
-                    if i > 0 and (s - delta) <= segments[i-1]["end"]: break
-                s = furthest_v
-            
-            seg["start"], seg["end"] = round(s, 3), round(e, 3)
-            refined.append(seg)
-            
         # 3. FINAL MONOTONICITY PASS (Crucial for eliminating tails)
         for i in range(1, len(refined)):
             # Force current start to be >= previous end
             if refined[i]["start"] < refined[i-1]["end"]:
                 # If overlap is small (< 0.1s), push current start forward
-                # If large, split the difference
                 overlap = refined[i-1]["end"] - refined[i]["start"]
                 if overlap < 0.15:
                     refined[i]["start"] = refined[i-1]["end"]
@@ -206,6 +162,46 @@ class WhisperAlignNode:
                 refined[i]["end"] = refined[i]["start"] + 0.01
 
         return refined
+
+    @staticmethod
+    def _find_quietest_point(wav: Any, sr: int, start_t: float, end_t: float) -> float:
+        """Find the timestamp with minimum RMS energy in a given range."""
+        import numpy as np
+        
+        # Ensure valid range
+        if start_t >= end_t: return start_t
+        
+        # Clamp to audio boundaries
+        max_t = len(wav) / sr
+        start_t = max(0.0, min(start_t, max_t))
+        end_t = max(0.0, min(end_t, max_t))
+        
+        start_sample = int(start_t * sr)
+        end_sample = int(end_t * sr)
+        
+        if end_sample - start_sample < 100: return (start_t + end_t) / 2
+        
+        chunk = wav[start_sample:end_sample]
+        
+        # Windowed RMS
+        win_size = int(sr * 0.005) # 5ms
+        hop_size = int(sr * 0.002) # 2ms
+        
+        n_frames = (len(chunk) - win_size) // hop_size + 1
+        if n_frames <= 0: return (start_t + end_t) / 2
+        
+        min_rms = float('inf')
+        best_frame = 0
+        
+        for i in range(n_frames):
+            f_start = i * hop_size
+            f_end = f_start + win_size
+            f_rms = np.sqrt(np.mean(chunk[f_start:f_end]**2))
+            if f_rms < min_rms:
+                min_rms = f_rms
+                best_frame = i
+        
+        return start_t + (best_frame * hop_size + win_size / 2) / sr
 
 
     def _align_words_to_text(self, original_text: str, whisper_chunks: List[Dict]) -> List[Dict]:
@@ -499,20 +495,21 @@ class AudioSplitByTimestampsNode:
             idx = item.get("index", i + 1)
             text = item.get("text", "")
             
-            # --- Midpoint Logic ---
-            # Start: Midpoint between prev_end and current_start
+            # --- Quietest Point Logic ---
+            # Search for best cut in 0.4s window around boundaries
             s_val = float(item.get("start", 0))
             if i > 0:
                 prev_e = float(timestamps[i-1].get("end", s_val))
-                actual_start = (prev_e + s_val) / 2
+                # Search range: between previous end and current start
+                actual_start = WhisperAlignNode._find_quietest_point(wav_np, sr, prev_e, s_val)
             else:
-                actual_start = 0.0 # First segment starts at beginning or specified 0.0
+                actual_start = 0.0 
             
-            # End: Midpoint between current_end and next_start
+            # Search for end point in silence between current and next
             e_val = float(item.get("end", s_val))
             if i < n - 1:
                 next_s = float(timestamps[i+1].get("start", e_val))
-                actual_end = (e_val + next_s) / 2
+                actual_end = WhisperAlignNode._find_quietest_point(wav_np, sr, e_val, next_s)
             else:
                 actual_end = wav.shape[-1] / sr # Last segment goes to end
             
@@ -535,7 +532,7 @@ class AudioSplitByTimestampsNode:
             segment = WhisperAlignNode._apply_fade(segment, sr, 50)
             
             audio_list.append({"waveform": segment, "sample_rate": sr})
-            print(f"[Whisper] ✂️ Segment {idx} (Midpoint + Fade): [{actual_start:.3f}s ~ {actual_end:.3f}s] \"{text}\"")
+            print(f"[Whisper] ✂️ Segment {idx} (Quiet-Point + Fade): [{actual_start:.3f}s ~ {actual_end:.3f}s] \"{text}\"")
 
         print(f"[Whisper] ✂️ Split into {len(audio_list)} seamless audio segments")
         return (audio_list,)
@@ -599,12 +596,12 @@ class WhisperOpeningSplitNode:
             opening_segments = timestamps[:split_index + 1]
             content_segments = timestamps[split_index + 1:]
             
-            # --- Midpoint Logic ---
+            # --- Quiet Point Logic ---
             t_opening_end = float(opening_segments[-1].get("end", 0.0))
             if content_segments:
                 t_content_start = float(content_segments[0].get("start", t_opening_end))
-                # Split exactly in the middle of the pause
-                split_time = (t_opening_end + t_content_start) / 2
+                # Search for the quietest point between opening end and content start
+                split_time = WhisperAlignNode._find_quietest_point(wav_np, sr, t_opening_end, t_content_start)
             else:
                 split_time = t_opening_end
 
@@ -639,7 +636,7 @@ class WhisperOpeningSplitNode:
         json_opening, srt_opening = WhisperAlignNode._format_output(opening_segments)
         json_content, srt_content = WhisperAlignNode._format_output(adjusted_content)
         
-        print(f"[Whisper] ✂️ Midpoint Split complete. Gap cut at {split_time:.3f}s")
+        print(f"[Whisper] ✂️ Quietest-Point Split complete. Gap cut at {split_time:.3f}s")
         return (audio_opening, json_opening, srt_opening, audio_content, json_content, srt_content)
 
 class WhisperSaveSubtitlesNode:
