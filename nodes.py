@@ -139,10 +139,52 @@ class WhisperAlignNode:
             chunk = wav[start : start + win_size]
             rms[i] = np.sqrt(np.mean(chunk**2))
             
-        # Threshold: 10% of median non-zero energy or a small floor
-        # Increased floor to 0.005 to better ignore background noise
-        threshold = np.percentile(rms[rms > 0], 30) if np.any(rms > 0) else 0.005
+        # Threshold: 30% of median non-zero energy or a small floor
+        active_rms = rms[rms > 0]
+        threshold = np.percentile(active_rms, 30) if len(active_rms) > 0 else 0.005
         threshold = max(threshold, 0.005)
+
+        def is_voiced(t):
+            frame_idx = int(t * sr / hop_size)
+            if frame_idx < 0 or frame_idx >= len(rms): return False
+            return rms[frame_idx] > threshold
+
+        # 2. Refine Boundaries with tight snapping
+        refined = []
+        for i, seg in enumerate(segments):
+            s, e = seg["start"], seg["end"]
+            
+            # Snap END forward: only if very clear voice
+            if is_voiced(e):
+                furthest_v = e
+                for delta in np.arange(0.01, 0.4, 0.01):
+                    if is_voiced(e + delta):
+                        furthest_v = e + delta
+                    else:
+                        break # Silence found
+                    if i + 1 < len(segments) and segments[i+1]["start"] >= 0:
+                        if (e + delta) >= segments[i+1]["start"]: break
+                e = furthest_v
+            else:
+                # Snap END backward: trim silence more aggressively
+                for delta in np.arange(0.01, 0.3, 0.01):
+                    if is_voiced(e - delta):
+                        e = e - delta + 0.01
+                        break
+
+            # Snap START: usually Whisper is good at start, but let's be safe
+            if is_voiced(s):
+                furthest_v = s
+                for delta in np.arange(0.01, 0.2, 0.01):
+                    if is_voiced(s - delta):
+                        furthest_v = s - delta
+                    else:
+                        break
+                    if i > 0 and (s - delta) <= segments[i-1]["end"]: break
+                s = furthest_v
+            
+            seg["start"], seg["end"] = round(s, 3), round(e, 3)
+            refined.append(seg)
 
         # 3. FINAL MONOTONICITY PASS (Crucial for eliminating tails)
         for i in range(1, len(refined)):
@@ -487,6 +529,13 @@ class AudioSplitByTimestampsNode:
         else:
             wav = waveform
 
+        # Prepare wav_np for quietest point detection
+        if wav.shape[0] > 1:
+            wav_mono = wav.mean(dim=0)
+        else:
+            wav_mono = wav[0]
+        wav_np = wav_mono.cpu().numpy()
+
         audio_list = []
         n = len(timestamps)
         
@@ -561,6 +610,20 @@ class WhisperOpeningSplitNode:
 
     def split(self, audio: Dict[str, Any], whisper_json: str, opening_text: str):
         import json as json_lib
+        
+        waveform = audio["waveform"]
+        sr = audio["sample_rate"]
+        
+        # Prepare wav_np for quietest point detection
+        if waveform.dim() == 3:
+            wav_tmp = waveform[0]
+        else:
+            wav_tmp = waveform
+        if wav_tmp.shape[0] > 1:
+            wav_mono = wav_tmp.mean(dim=0)
+        else:
+            wav_mono = wav_tmp[0]
+        wav_np = wav_mono.cpu().numpy()
         
         try:
             timestamps = json_lib.loads(whisper_json)
