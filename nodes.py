@@ -149,44 +149,62 @@ class WhisperAlignNode:
             if frame_idx < 0 or frame_idx >= len(rms): return False
             return rms[frame_idx] > threshold
 
-        # 2. Refine Boundaries
+        # 2. Refine Boundaries with tight snapping
         refined = []
         for i, seg in enumerate(segments):
             s, e = seg["start"], seg["end"]
             
-            # Snap END forward: if still voiced at 'e', look forward up to 0.5s
+            # Snap END forward: only if very clear voice
             if is_voiced(e):
                 furthest_v = e
-                for delta in np.arange(0.01, 0.5, 0.01):
+                for delta in np.arange(0.01, 0.4, 0.01):
                     if is_voiced(e + delta):
                         furthest_v = e + delta
                     else:
-                        break # Found silence
-                    if i + 1 < len(segments) and (e + delta) >= segments[i+1]["start"]:
-                        break
+                        break # Silence found
+                    # Safe check for overlap
+                    if i + 1 < len(segments) and segments[i+1]["start"] >= 0:
+                        if (e + delta) >= segments[i+1]["start"]: break
                 e = furthest_v
             else:
-                # Snap END backward: if silence at 'e', look back up to 0.3s
+                # Snap END backward: trim silence more aggressively
                 for delta in np.arange(0.01, 0.3, 0.01):
                     if is_voiced(e - delta):
-                        e = e - delta + 0.02 # Add tiny safety margin
+                        e = e - delta + 0.01
                         break
 
-            # Snap START backward: if voiced at 's', look back up to 0.3s
+            # Snap START: usually Whisper is good at start, but let's be safe
             if is_voiced(s):
                 furthest_v = s
-                for delta in np.arange(0.01, 0.3, 0.01):
+                for delta in np.arange(0.01, 0.2, 0.01):
                     if is_voiced(s - delta):
                         furthest_v = s - delta
                     else:
                         break
-                    if i > 0 and (s - delta) <= segments[i-1]["end"]:
-                        break
+                    if i > 0 and (s - delta) <= segments[i-1]["end"]: break
                 s = furthest_v
             
             seg["start"], seg["end"] = round(s, 3), round(e, 3)
             refined.append(seg)
             
+        # 3. FINAL MONOTONICITY PASS (Crucial for eliminating tails)
+        for i in range(1, len(refined)):
+            # Force current start to be >= previous end
+            if refined[i]["start"] < refined[i-1]["end"]:
+                # If overlap is small (< 0.1s), push current start forward
+                # If large, split the difference
+                overlap = refined[i-1]["end"] - refined[i]["start"]
+                if overlap < 0.15:
+                    refined[i]["start"] = refined[i-1]["end"]
+                else:
+                    mid = (refined[i-1]["end"] + refined[i]["start"]) / 2
+                    refined[i-1]["end"] = mid
+                    refined[i]["start"] = mid
+            
+            # Ensure start < end for each segment
+            if refined[i]["end"] < refined[i]["start"]:
+                refined[i]["end"] = refined[i]["start"] + 0.01
+
         return refined
 
 
