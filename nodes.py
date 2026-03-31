@@ -545,22 +545,25 @@ class AudioSplitByTimestampsNode:
             text = item.get("text", "")
             
             # --- Quietest Point Logic ---
-            # Search for best cut in 0.4s window around boundaries
+            # Search window: ±0.2s around Whisper boundaries to find TRUE silence
             s_val = float(item.get("start", 0))
             if i > 0:
                 prev_e = float(timestamps[i-1].get("end", s_val))
-                # Search range: between previous end and current start
-                actual_start = WhisperAlignNode._find_quietest_point(wav_np, sr, prev_e, s_val)
+                # Search around the gap
+                search_s = max(0.0, prev_e - 0.2)
+                search_e = min(wav.shape[-1]/sr, s_val + 0.2)
+                actual_start = WhisperAlignNode._find_quietest_point(wav_np, sr, search_s, search_e)
             else:
                 actual_start = 0.0 
             
-            # Search for end point in silence between current and next
             e_val = float(item.get("end", s_val))
             if i < n - 1:
                 next_s = float(timestamps[i+1].get("start", e_val))
-                actual_end = WhisperAlignNode._find_quietest_point(wav_np, sr, e_val, next_s)
+                search_s = max(0.0, e_val - 0.2)
+                search_e = min(wav.shape[-1]/sr, next_s + 0.2)
+                actual_end = WhisperAlignNode._find_quietest_point(wav_np, sr, search_s, search_e)
             else:
-                actual_end = wav.shape[-1] / sr # Last segment goes to end
+                actual_end = wav.shape[-1] / sr
             
             # Convert to samples
             start_sample = int(actual_start * sr)
@@ -578,7 +581,7 @@ class AudioSplitByTimestampsNode:
 
             segment = wav[:, start_sample:end_sample].unsqueeze(0)
             # Apply Micro-fade
-            segment = WhisperAlignNode._apply_fade(segment, sr, 50)
+            segment = WhisperAlignNode._apply_fade(segment, sr, 20)
             
             audio_list.append({"waveform": segment, "sample_rate": sr})
             print(f"[Whisper] ✂️ Segment {idx} (Quiet-Point + Fade): [{actual_start:.3f}s ~ {actual_end:.3f}s] \"{text}\"")
@@ -663,8 +666,14 @@ class WhisperOpeningSplitNode:
             t_opening_end = float(opening_segments[-1].get("end", 0.0))
             if content_segments:
                 t_content_start = float(content_segments[0].get("start", t_opening_end))
-                # Search for the quietest point between opening end and content start
-                split_time = WhisperAlignNode._find_quietest_point(wav_np, sr, t_opening_end, t_content_start)
+                # Expanded window: Search ±0.3s around the boundary
+                search_s = max(0.0, t_opening_end - 0.3)
+                search_e = min(waveform.shape[-1]/sr, t_content_start + 0.3)
+                split_time = WhisperAlignNode._find_quietest_point(wav_np, sr, search_s, search_e)
+                
+                # Sync timestamps to the actual acoustic cut
+                opening_segments[-1]["end"] = round(split_time, 3)
+                # Content will be re-zeroed below
             else:
                 split_time = t_opening_end
 
@@ -690,8 +699,8 @@ class WhisperOpeningSplitNode:
             waveform_v = waveform.unsqueeze(0)
 
         # Apply Fades
-        wav_opening = WhisperAlignNode._apply_fade(wav_opening, sr, 50)
-        wav_content = WhisperAlignNode._apply_fade(wav_content, sr, 50)
+        wav_opening = WhisperAlignNode._apply_fade(wav_opening, sr, 20)
+        wav_content = WhisperAlignNode._apply_fade(wav_content, sr, 20)
 
         audio_opening = {"waveform": wav_opening, "sample_rate": sr}
         audio_content = {"waveform": wav_content, "sample_rate": sr}
