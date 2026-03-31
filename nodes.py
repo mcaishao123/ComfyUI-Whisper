@@ -207,13 +207,11 @@ class WhisperAlignNode:
 
     @staticmethod
     def _find_quietest_point(wav: Any, sr: int, start_t: float, end_t: float) -> float:
-        """Find the timestamp with minimum RMS energy in a given range."""
+        """Find the timestamp with minimum RMS energy, biased towards the center."""
         import numpy as np
         
-        # Ensure valid range
         if start_t >= end_t: return start_t
         
-        # Clamp to audio boundaries
         max_t = len(wav) / sr
         start_t = max(0.0, min(start_t, max_t))
         end_t = max(0.0, min(end_t, max_t))
@@ -232,15 +230,24 @@ class WhisperAlignNode:
         n_frames = (len(chunk) - win_size) // hop_size + 1
         if n_frames <= 0: return (start_t + end_t) / 2
         
-        min_rms = float('inf')
-        best_frame = 0
+        # Pick the minimum RMS point with a bias toward the original estimated center
+        # This prevents the cut from jumping too far into the next word if it's also quiet
+        center_frame = n_frames / 2
+        min_score = float('inf')
+        best_frame = center_frame
         
         for i in range(n_frames):
             f_start = i * hop_size
             f_end = f_start + win_size
             f_rms = np.sqrt(np.mean(chunk[f_start:f_end]**2))
-            if f_rms < min_rms:
-                min_rms = f_rms
+            
+            # Distance penalty: 0.1% increase in "effective energy" for every frame away from center
+            # This makes the algorithm prefer the Whisper-estimated boundary if silence quality is similar
+            dist_penalty = 1.0 + (abs(i - center_frame) / n_frames) * 0.2
+            score = f_rms * dist_penalty
+            
+            if score < min_score:
+                min_score = score
                 best_frame = i
         
         return start_t + (best_frame * hop_size + win_size / 2) / sr
@@ -545,13 +552,13 @@ class AudioSplitByTimestampsNode:
             text = item.get("text", "")
             
             # --- Quietest Point Logic ---
-            # Search window: ±0.2s around Whisper boundaries to find TRUE silence
+            # Search window: ±0.1s around Whisper boundaries (Tight Window)
             s_val = float(item.get("start", 0))
             if i > 0:
                 prev_e = float(timestamps[i-1].get("end", s_val))
                 # Search around the gap
-                search_s = max(0.0, prev_e - 0.2)
-                search_e = min(wav.shape[-1]/sr, s_val + 0.2)
+                search_s = max(0.0, prev_e - 0.1)
+                search_e = min(wav.shape[-1]/sr, s_val + 0.1)
                 actual_start = WhisperAlignNode._find_quietest_point(wav_np, sr, search_s, search_e)
             else:
                 actual_start = 0.0 
@@ -559,8 +566,8 @@ class AudioSplitByTimestampsNode:
             e_val = float(item.get("end", s_val))
             if i < n - 1:
                 next_s = float(timestamps[i+1].get("start", e_val))
-                search_s = max(0.0, e_val - 0.2)
-                search_e = min(wav.shape[-1]/sr, next_s + 0.2)
+                search_s = max(0.0, e_val - 0.1)
+                search_e = min(wav.shape[-1]/sr, next_s + 0.1)
                 actual_end = WhisperAlignNode._find_quietest_point(wav_np, sr, search_s, search_e)
             else:
                 actual_end = wav.shape[-1] / sr
@@ -666,9 +673,9 @@ class WhisperOpeningSplitNode:
             t_opening_end = float(opening_segments[-1].get("end", 0.0))
             if content_segments:
                 t_content_start = float(content_segments[0].get("start", t_opening_end))
-                # Expanded window: Search ±0.3s around the boundary
-                search_s = max(0.0, t_opening_end - 0.3)
-                search_e = min(waveform.shape[-1]/sr, t_content_start + 0.3)
+                # Tight window: Search ±0.1s around the boundary
+                search_s = max(0.0, t_opening_end - 0.1)
+                search_e = min(waveform.shape[-1]/sr, t_content_start + 0.1)
                 split_time = WhisperAlignNode._find_quietest_point(wav_np, sr, search_s, search_e)
                 
                 # Sync timestamps to the actual acoustic cut
