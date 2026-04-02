@@ -10,8 +10,38 @@ import os
 import folder_paths
 from typing import Dict, Any, List, Tuple, Optional
 
-# Global model cache
+# Global model caches
 _WHISPER_CACHE = {}
+_SENSEVOICE_CACHE = {}
+
+
+def _get_sensevoice_model(device: str):
+    """Load or get cached SenseVoice model."""
+    global _SENSEVOICE_CACHE
+
+    if device == "auto":
+        device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
+    else:
+        device_str = device
+
+    if device_str in _SENSEVOICE_CACHE:
+        print(f"[Whisper] Using cached SenseVoiceSmall on {device_str}")
+        return _SENSEVOICE_CACHE[device_str]
+
+    try:
+        from funasr import AutoModel
+        print(f"[Whisper] Loading SenseVoiceSmall on {device_str}...")
+        model = AutoModel(
+            model="iic/SenseVoiceSmall",
+            vad_model="fsmn-vad",
+            vad_kwargs={"max_single_segment_time": 30000},
+            device=device_str,
+            trust_remote_code=True
+        )
+        _SENSEVOICE_CACHE[device_str] = model
+        return model
+    except ImportError:
+        raise ImportError("The 'funasr' and 'modelscope' packages are required for SenseVoice. Please ensure they are installed and restart ComfyUI.")
 
 
 def _get_whisper_pipeline(model_size: str, device: str, language: str):
@@ -61,6 +91,7 @@ class WhisperAlignNode:
             "required": {
                 "audio": ("AUDIO",),
                 "text": ("STRING", {"multiline": True, "default": "", "placeholder": "Original text to align"}),
+                "engine": (["Whisper", "SenseVoice"], {"default": "Whisper"}),
                 "model_size": (["tiny", "base", "small", "medium", "large-v3"], {"default": "medium"}),
                 "language": ("STRING", {"default": "zh", "placeholder": "Language code (zh, en, ja, etc.)"}),
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
@@ -73,7 +104,7 @@ class WhisperAlignNode:
     CATEGORY = "Whisper"
     DESCRIPTION = "Use Whisper to perform forced alignment on audio with original text, producing accurate word-level subtitle timestamps."
 
-    def align(self, audio: Dict[str, Any], text: str, model_size: str, language: str, device: str) -> Tuple[str, str]:
+    def align(self, audio: Dict[str, Any], text: str, engine: str, model_size: str, language: str, device: str) -> Tuple[str, str]:
         if not text.strip():
             raise RuntimeError("Text is required for alignment")
 
@@ -99,18 +130,52 @@ class WhisperAlignNode:
             )
             wav_np = wav_16k[0].numpy()
 
-        pipe = _get_whisper_pipeline(model_size, device, language)
+        if engine == "SenseVoice":
+            model = _get_sensevoice_model(device)
+            print(f"[Whisper] (SenseVoice) Transcribing audio ({len(wav_np)/16000:.1f}s)...")
+            # SenseVoice expects input at 16k mono
+            res = model.generate(
+                input=wav_np,
+                cache={},
+                language=language if language != "auto" else "auto",
+                use_itn=True,
+                batch_size_s=60,
+            )
+            
+            # Map SenseVoice output to Whisper-like chunks
+            whisper_chunks = []
+            if res and isinstance(res, list) and len(res) > 0:
+                # Check for timestamp or sentence_info
+                # SenseVoice/FunASR result format varies by version, usually: 
+                # [{'text': '...', 'timestamp': [[s, e], ...], 'sentence_info': [...]}]
+                item = res[0]
+                text_content = item.get("text", "")
+                
+                # If we have sentence-level timestamps from VAD
+                if "timestamp" in item:
+                    # Some versions return [[s, e], ...]
+                    # We need to pair them with text splits or use as is
+                    for ts in item["timestamp"]:
+                        start_t, end_t = ts[0] / 1000.0, ts[1] / 1000.0
+                        whisper_chunks.append({
+                            "text": "", # Text mapping happens in align_words_to_text
+                            "text": "", 
+                            "timestamp": (ts[0] / 1000.0, ts[1] / 1000.0)
+                        })
+                else:
+                    whisper_chunks.append({"text": text_content, "timestamp": (0.0, len(wav_np)/16000)})
+        else:
+            pipe = _get_whisper_pipeline(model_size, device, language)
+            print(f"[Whisper] Transcribing audio ({len(wav_np)/16000:.1f}s) with word-level timestamps...")
+            result = pipe(
+                wav_np,
+                return_timestamps="word",
+                generate_kwargs={"language": language, "task": "transcribe"},
+            )
+            whisper_chunks = result.get("chunks", [])
 
-        print(f"[Whisper] Transcribing audio ({len(wav_np)/16000:.1f}s) with word-level timestamps...")
-        result = pipe(
-            wav_np,
-            return_timestamps="word",
-            generate_kwargs={"language": language, "task": "transcribe"},
-        )
-
-        whisper_chunks = result.get("chunks", [])
         if not whisper_chunks:
-            raise RuntimeError("Whisper did not produce any word-level results.")
+            raise RuntimeError(f"{engine} did not produce any results.")
 
         subtitle_segments = self._align_words_to_text(text, whisper_chunks)
         
@@ -430,6 +495,7 @@ class WhisperTranscribeNode:
         return {
             "required": {
                 "audio": ("AUDIO",),
+                "engine": (["Whisper", "SenseVoice"], {"default": "Whisper"}),
                 "model_size": (["tiny", "base", "small", "medium", "large-v3"], {"default": "medium"}),
                 "language": ("STRING", {"default": "zh", "placeholder": "Language code (zh, en, ja, etc.)"}),
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
@@ -443,7 +509,7 @@ class WhisperTranscribeNode:
     CATEGORY = "Whisper"
     DESCRIPTION = "Transcribe audio to text using Whisper. Optionally include word or sentence-level timestamps."
 
-    def transcribe(self, audio: Dict[str, Any], model_size: str, language: str, device: str, timestamps: str) -> Tuple[str, str]:
+    def transcribe(self, audio: Dict[str, Any], engine: str, model_size: str, language: str, device: str, timestamps: str) -> Tuple[str, str]:
         waveform = audio["waveform"]
         sr = audio["sample_rate"]
 
@@ -466,23 +532,45 @@ class WhisperTranscribeNode:
             )
             wav_np = wav_16k[0].numpy()
 
-        pipe = _get_whisper_pipeline(model_size, device, language)
-
-        ts_param = None
-        if timestamps == "word":
-            ts_param = "word"
-        elif timestamps == "sentence":
-            ts_param = True
-
-        kwargs = {"language": language, "task": "transcribe"}
-
-        if ts_param is not None:
-            result = pipe(wav_np, return_timestamps=ts_param, generate_kwargs=kwargs)
+        if engine == "SenseVoice":
+            model = _get_sensevoice_model(device)
+            print(f"[Whisper] (SenseVoice) Transcribing audio ({len(wav_np)/16000:.1f}s)...")
+            res = model.generate(
+                input=wav_np,
+                cache={},
+                language=language if language != "auto" else "auto",
+                use_itn=True,
+                batch_size_s=60,
+            )
+            
+            full_text = ""
+            chunks = []
+            if res and isinstance(res, list) and len(res) > 0:
+                item = res[0]
+                full_text = item.get("text", "")
+                
+                # If we have sentence-level timestamps from VAD
+                if "timestamp" in item:
+                    for ts_entry in item["timestamp"]:
+                        start_t, end_t = ts_entry[0] / 1000.0, ts_entry[1] / 1000.0
+                        chunks.append({
+                            "text": "", 
+                            "timestamp": (start_t, end_t)
+                        })
+                else:
+                    chunks.append({"text": full_text, "timestamp": (0.0, len(wav_np)/16000)})
         else:
-            result = pipe(wav_np, generate_kwargs=kwargs)
-
-        full_text = result.get("text", "")
-        chunks = result.get("chunks", [])
+            pipe = _get_whisper_pipeline(model_size, device, language)
+            ts_param = "word" if timestamps == "word" else (True if timestamps == "sentence" else None)
+            
+            kwargs = {"language": language, "task": "transcribe"}
+            if ts_param is not None:
+                result = pipe(wav_np, return_timestamps=ts_param, generate_kwargs=kwargs)
+            else:
+                result = pipe(wav_np, generate_kwargs=kwargs)
+            
+            full_text = result.get("text", "")
+            chunks = result.get("chunks", [])
 
         ts_data = []
         for chunk in chunks:
