@@ -186,23 +186,23 @@ class WhisperAlignNode:
             seg["start"], seg["end"] = round(s, 3), round(e, 3)
             refined.append(seg)
 
-        # 3. FINAL MONOTONICITY PASS (Crucial for eliminating tails)
+        # 3. FINAL PASS: Force perfect non-overlap 
         for i in range(1, len(refined)):
-            # Force current start to be >= previous end
-            if refined[i]["start"] < refined[i-1]["end"]:
-                # If overlap is small (< 0.1s), push current start forward
+            # If segments are touching or overlapping, ensure a tiny safety gap
+            if refined[i]["start"] <= refined[i-1]["end"]:
                 overlap = refined[i-1]["end"] - refined[i]["start"]
                 if overlap < 0.15:
-                    refined[i]["start"] = refined[i-1]["end"]
-                else:
+                    q = self._find_quietest_point(wav, sr, refined[i]["start"], refined[i-1]["end"])
+                    # Subtract a tiny bias (10ms) from end to favor the previous segment's silence
+                    refined[i-1]["end"] = max(0.0, q - 0.01)
+                    refined[i]["start"] = q
+                else: 
                     mid = (refined[i-1]["end"] + refined[i]["start"]) / 2
-                    refined[i-1]["end"] = mid
+                    refined[i-1]["end"] = max(0.0, mid - 0.01)
                     refined[i]["start"] = mid
             
-            # Ensure start < end for each segment
             if refined[i]["end"] < refined[i]["start"]:
-                refined[i]["end"] = refined[i]["start"] + 0.01
-
+                refined[i]["end"] = refined[i]["start"] + 0.02
         return refined
 
     @staticmethod
