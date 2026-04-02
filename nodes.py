@@ -91,9 +91,9 @@ class WhisperAlignNode:
             "required": {
                 "audio": ("AUDIO",),
                 "text": ("STRING", {"multiline": True, "default": "", "placeholder": "Original text to align"}),
-                "engine": (["Whisper", "SenseVoice"], {"default": "Whisper"}),
+                "engine": (["Whisper", "SenseVoice"], {"default": "SenseVoice"}),
                 "model_size": (["tiny", "base", "small", "medium", "large-v3"], {"default": "medium"}),
-                "language": ("STRING", {"default": "zh", "placeholder": "Language code (zh, en, ja, etc.)"}),
+                "language": ("STRING", {"default": "zh", "placeholder": "语言代码 (zh, en, ja 等)"}),
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
             },
         }
@@ -495,9 +495,9 @@ class WhisperTranscribeNode:
         return {
             "required": {
                 "audio": ("AUDIO",),
-                "engine": (["Whisper", "SenseVoice"], {"default": "Whisper"}),
+                "engine": (["Whisper", "SenseVoice"], {"default": "SenseVoice"}),
                 "model_size": (["tiny", "base", "small", "medium", "large-v3"], {"default": "medium"}),
-                "language": ("STRING", {"default": "zh", "placeholder": "Language code (zh, en, ja, etc.)"}),
+                "language": ("STRING", {"default": "zh", "placeholder": "语言代码 (zh, en, ja 等)"}),
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
                 "timestamps": (["none", "word", "sentence"], {"default": "sentence"}),
             },
