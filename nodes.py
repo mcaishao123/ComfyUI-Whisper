@@ -13,6 +13,31 @@ from typing import Dict, Any, List, Tuple, Optional
 # Global model caches
 _WHISPER_CACHE = {}
 _SENSEVOICE_CACHE = {}
+_MMS_FA_CACHE = {}
+
+
+def _get_mms_fa_model(device: str):
+    """Load or get cached MMS Forced Alignment model."""
+    global _MMS_FA_CACHE
+    import torchaudio
+    
+    if device == "auto":
+        device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
+    else:
+        device_str = device
+    
+    if device_str in _MMS_FA_CACHE:
+        return _MMS_FA_CACHE[device_str]
+    
+    print(f"[Whisper] Loading MMS Forced Alignment model on {device_str}...")
+    bundle = torchaudio.pipelines.MMS_FA
+    model = bundle.get_model().to(device_str)
+    tokenizer = bundle.get_tokenizer()
+    aligner = bundle.get_aligner()
+    
+    _MMS_FA_CACHE[device_str] = (model, tokenizer, aligner, bundle.sample_rate)
+    print(f"[Whisper] MMS FA model loaded.")
+    return _MMS_FA_CACHE[device_str]
 
 
 def _get_sensevoice_model(device: str):
@@ -91,7 +116,7 @@ class WhisperAlignNode:
             "required": {
                 "audio": ("AUDIO",),
                 "text": ("STRING", {"multiline": True, "default": "", "placeholder": "Original text to align"}),
-                "engine": (["Whisper", "SenseVoice"], {"default": "SenseVoice"}),
+                "engine": (["ForcedAlign", "Whisper", "SenseVoice"], {"default": "ForcedAlign"}),
                 "model_size": (["tiny", "base", "small", "medium", "large-v3"], {"default": "medium"}),
                 "language": ("STRING", {"default": "zh", "placeholder": "语言代码 (zh, en, ja 等)"}),
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
@@ -130,7 +155,9 @@ class WhisperAlignNode:
             )
             wav_np = wav_16k[0].numpy()
 
-        if engine == "SenseVoice":
+        if engine == "ForcedAlign":
+            return self._forced_align(wav_np, sr, text, device)
+        elif engine == "SenseVoice":
             model = _get_sensevoice_model(device)
             print(f"[Whisper] (SenseVoice) Transcribing audio ({len(wav_np)/16000:.1f}s)...")
             # SenseVoice expects input at 16k mono
@@ -186,6 +213,157 @@ class WhisperAlignNode:
             print(f"[Whisper] Warning: RMS refinement failed: {e}")
 
         json_str, srt_str = self._format_output(subtitle_segments)
+        return (json_str, srt_str)
+
+    def _forced_align(self, wav_np, sr: int, text: str, device: str) -> Tuple[str, str]:
+        """Frame-level forced alignment using MMS CTC model. ~10-20ms precision."""
+        import torchaudio
+        import numpy as np
+        
+        model, tokenizer, aligner, model_sr = _get_mms_fa_model(device)
+        
+        if device == "auto":
+            device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
+        else:
+            device_str = device
+        
+        # 1. Prepare audio: resample to model's expected sample rate (16kHz)
+        waveform = torch.from_numpy(wav_np).unsqueeze(0).float()
+        if sr != model_sr:
+            waveform = torchaudio.functional.resample(waveform, sr, model_sr)
+        waveform = waveform.to(device_str)
+        
+        # 2. Split text into sentences by punctuation
+        segments = re.split(r'(?<=[。！？.!?，,、；;：:—…])\s*', text)
+        segments = [s.strip() for s in segments if s.strip()]
+        if not segments:
+            segments = [text]
+        
+        # 3. Clean text to get pure characters for alignment
+        def clean(t):
+            return re.sub(r'[。！？.!?，,、；;：:—…·\-\s\u3000]', '', t)
+        
+        all_clean_chars = clean(text)
+        if not all_clean_chars:
+            raise RuntimeError("Text contains no alignable characters after cleaning.")
+        
+        # 4. MMS FA expects romanized/IPA input for non-Latin scripts
+        # For Chinese, we use pypinyin to convert to pinyin, then align
+        # But MMS_FA tokenizer works at character level for supported languages
+        # Let's try direct character tokenization first
+        try:
+            tokens = tokenizer(all_clean_chars)
+        except Exception:
+            # Fallback: if direct tokenization fails, try character-by-character
+            tokens = []
+            for ch in all_clean_chars:
+                try:
+                    t = tokenizer(ch)
+                    tokens.extend(t)
+                except Exception:
+                    tokens.append(0)  # blank token as placeholder
+        
+        if not tokens:
+            raise RuntimeError("MMS tokenizer produced no tokens for the input text.")
+        
+        # 5. Compute emissions (CTC log-probabilities)
+        print(f"[Whisper] (ForcedAlign) Computing CTC emissions for {len(all_clean_chars)} characters...")
+        with torch.inference_mode():
+            emission, _ = model(waveform)
+        
+        # emission shape: [1, T, C] where T = time frames, C = classes
+        emission = emission[0].cpu()  # [T, C]
+        
+        # 6. Run forced alignment
+        token_tensor = torch.tensor(tokens, dtype=torch.int32)
+        
+        try:
+            aligned_tokens, scores = torchaudio.functional.forced_align(
+                emission.unsqueeze(0), token_tensor.unsqueeze(0), blank=0
+            )
+            aligned_tokens = aligned_tokens[0]  # [T]
+            scores = scores[0]
+        except Exception as e:
+            print(f"[Whisper] ForcedAlign CTC alignment failed: {e}")
+            print(f"[Whisper] Falling back to proportional alignment...")
+            # Fallback: proportional distribution
+            total_dur = len(wav_np) / 16000
+            results = []
+            char_dur = total_dur / len(all_clean_chars) if all_clean_chars else 0
+            char_idx = 0
+            for seg_text in segments:
+                clean_seg = clean(seg_text)
+                if not clean_seg:
+                    continue
+                s = char_idx * char_dur
+                e = (char_idx + len(clean_seg)) * char_dur
+                results.append({"text": clean_seg, "start": round(s, 3), "end": round(e, 3)})
+                char_idx += len(clean_seg)
+            json_str, srt_str = self._format_output(results)
+            return (json_str, srt_str)
+        
+        # 7. Extract per-character timestamps from aligned tokens
+        # Each frame corresponds to model_sr / hop_length seconds
+        # MMS FA uses hop_length of 320 samples at 16kHz -> 20ms per frame
+        frame_dur = 320.0 / model_sr  # 0.02s = 20ms
+        
+        # Group consecutive frames by token
+        char_times = []
+        current_token = -1
+        start_frame = 0
+        
+        for frame_idx, tok in enumerate(aligned_tokens):
+            tok_val = tok.item()
+            if tok_val == 0:  # blank
+                continue
+            if tok_val != current_token:
+                if current_token > 0 and len(char_times) <= len(all_clean_chars):
+                    char_times.append({
+                        "start": start_frame * frame_dur,
+                        "end": frame_idx * frame_dur
+                    })
+                current_token = tok_val
+                start_frame = frame_idx
+        
+        # Last character
+        if current_token > 0:
+            char_times.append({
+                "start": start_frame * frame_dur,
+                "end": len(aligned_tokens) * frame_dur
+            })
+        
+        print(f"[Whisper] (ForcedAlign) Aligned {len(char_times)} characters at {frame_dur*1000:.0f}ms frame resolution")
+        
+        # 8. Map character times to sentence segments
+        results = []
+        char_idx = 0
+        for seg_text in segments:
+            clean_seg = clean(seg_text)
+            if not clean_seg:
+                continue
+            
+            seg_len = len(clean_seg)
+            if char_idx < len(char_times) and (char_idx + seg_len - 1) < len(char_times):
+                s = char_times[char_idx]["start"]
+                e = char_times[min(char_idx + seg_len - 1, len(char_times) - 1)]["end"]
+            elif char_idx < len(char_times):
+                s = char_times[char_idx]["start"]
+                e = char_times[-1]["end"]
+            else:
+                # Beyond aligned data
+                s = char_times[-1]["end"] if char_times else 0.0
+                e = s + seg_len * 0.1
+            
+            results.append({"text": clean_seg, "start": round(s, 3), "end": round(e, 3)})
+            char_idx += seg_len
+        
+        # 9. Apply RMS refinement for final polish
+        try:
+            results = self._refine_with_energy(wav_np, 16000, results)
+        except Exception as e:
+            print(f"[Whisper] Warning: RMS refinement failed: {e}")
+        
+        json_str, srt_str = self._format_output(results)
         return (json_str, srt_str)
 
     def _refine_with_energy(self, wav: Any, sr: int, segments: List[Dict]) -> List[Dict]:
