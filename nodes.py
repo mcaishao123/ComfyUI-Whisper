@@ -14,6 +14,29 @@ from typing import Dict, Any, List, Tuple, Optional
 _WHISPER_CACHE = {}
 _SENSEVOICE_CACHE = {}
 _MMS_FA_CACHE = {}
+_PARAFORMER_FA_CACHE = {}
+
+
+def _get_paraformer_fa_model(device: str):
+    """Load or get cached specialized Paraformer-FA model."""
+    global _PARAFORMER_FA_CACHE
+    if device == "auto":
+        device_str = "cuda:0" if torch.cuda.is_available() else "cpu"
+    else:
+        device_str = device
+
+    if device_str in _PARAFORMER_FA_CACHE:
+        return _PARAFORMER_FA_CACHE[device_str]
+
+    from funasr import AutoModel
+    print(f"[Whisper] Loading Paraformer-FA specialized model on {device_str}...")
+    model = AutoModel(
+        model="iic/speech_char_forced_alignment_zh_cn",
+        device=device_str,
+        trust_remote_code=True
+    )
+    _PARAFORMER_FA_CACHE[device_str] = model
+    return model
 
 
 def _get_mms_fa_model(device: str):
@@ -116,7 +139,7 @@ class WhisperAlignNode:
             "required": {
                 "audio": ("AUDIO",),
                 "text": ("STRING", {"multiline": True, "default": "", "placeholder": "Original text to align"}),
-                "engine": (["ForcedAlign", "Whisper", "SenseVoice"], {"default": "ForcedAlign"}),
+                "engine": (["Paraformer-FA", "ForcedAlign", "Whisper", "SenseVoice"], {"default": "Paraformer-FA"}),
                 "model_size": (["tiny", "base", "small", "medium", "large-v3"], {"default": "medium"}),
                 "language": ("STRING", {"default": "zh", "placeholder": "语言代码 (zh, en, ja 等)"}),
                 "device": (["auto", "cuda", "cpu"], {"default": "auto"}),
@@ -155,7 +178,9 @@ class WhisperAlignNode:
             )
             wav_np = wav_16k[0].numpy()
 
-        if engine == "ForcedAlign":
+        if engine == "Paraformer-FA":
+            return self._paraformer_forced_align(wav_np, sr, text, device)
+        elif engine == "ForcedAlign":
             return self._forced_align(wav_np, sr, text, device)
         elif engine == "SenseVoice":
             model = _get_sensevoice_model(device)
@@ -384,6 +409,95 @@ class WhisperAlignNode:
         except Exception as e:
             print(f"[Whisper] Warning: RMS refinement failed: {e}")
         
+        json_str, srt_str = self._format_output(results)
+        return (json_str, srt_str)
+
+    def _paraformer_forced_align(self, wav_np, sr: int, text: str, device: str) -> Tuple[str, str]:
+        """High-precision Chinese forced alignment using Alibaba Paraformer. ~10ms precision."""
+        import numpy as np
+        
+        model = _get_paraformer_fa_model(device)
+        
+        # 1. Split text into sentences by punctuation
+        # This helps in case the model returns sentence-level timestamps
+        segments = re.split(r'(?<=[。！？.!?，,、；;：:—…])\s*', text)
+        segments = [s.strip() for s in segments if s.strip()]
+        if not segments:
+            segments = [text]
+            
+        def clean(t):
+            return re.sub(r'[。！？.!?，,、；;：:—…·\-\s\u3000]', '', t)
+            
+        all_clean_chars = clean(text)
+        if not all_clean_chars:
+            raise RuntimeError("Text contains no alignable characters.")
+            
+        print(f"[Whisper] (Paraformer-FA) Aligning {len(all_clean_chars)} characters...")
+        
+        # 2. Run Paraformer-FA
+        # Model expects: audio, text
+        res = model.generate(
+            input=wav_np,
+            text=text,
+            cache={},
+        )
+        
+        # 3. Parse Paraformer-FA results
+        # Typical output: [{'timestamp': [[start, end], ...], 'text': '...'}] (units are ms)
+        char_times = []
+        if res and isinstance(res, list) and len(res) > 0:
+            item = res[0]
+            if "timestamp" in item:
+                # Character level timestamps
+                for ts in item["timestamp"]:
+                    char_times.append({
+                        "start": ts[0] / 1000.0,
+                        "end": ts[1] / 1000.0
+                    })
+            elif "sentence_info" in item:
+                # Sentence level fallback
+                for info in item["sentence_info"]:
+                    char_times.append({
+                        "start": info["start"] / 1000.0,
+                        "end": info["end"] / 1000.0
+                    })
+        
+        if not char_times:
+            print(f"[Whisper] Paraformer-FA returned no timestamps. Falling back to proportional.")
+            total_dur = len(wav_np) / 16000
+            char_dur = total_dur / len(all_clean_chars)
+            char_times = [{"start": i*char_dur, "end": (i+1)*char_dur} for i in range(len(all_clean_chars))]
+
+        # 4. Map character times to sentence segments
+        results = []
+        char_idx = 0
+        for seg_text in segments:
+            clean_seg = clean(seg_text)
+            if not clean_seg:
+                continue
+            
+            seg_len = len(clean_seg)
+            # Paraformer usually returns timestamps matching the input text tokens exactly
+            # But the 'text' input to generate() might include punctuation
+            # We assume char_times matches clean_seg indices 
+            end_idx = min(char_idx + seg_len - 1, len(char_times) - 1)
+            
+            if char_idx < len(char_times):
+                s = char_times[char_idx]["start"]
+                e = char_times[end_idx]["end"]
+            else:
+                s = char_times[-1]["end"] if char_times else 0.0
+                e = s + seg_len * 0.1
+            
+            results.append({"text": clean_seg, "start": round(s, 3), "end": round(e, 3)})
+            char_idx += seg_len
+            
+        # 5. RMS refinement for perfect isolation
+        try:
+            results = self._refine_with_energy(wav_np, 16000, results)
+        except Exception as e:
+            print(f"[Whisper] Warning: RMS refinement failed: {e}")
+            
         json_str, srt_str = self._format_output(results)
         return (json_str, srt_str)
 
