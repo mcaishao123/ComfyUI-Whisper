@@ -29,9 +29,9 @@ def _get_paraformer_fa_model(device: str):
         return _PARAFORMER_FA_CACHE[device_str]
 
     from funasr import AutoModel
-    print(f"[Whisper] Loading Paraformer-FA specialized model on {device_str}...")
+    print(f"[Whisper] Loading Paraformer-FA ('fa-zh') specialized model on {device_str}...")
     model = AutoModel(
-        model="iic/speech_char_forced_alignment_zh_cn",
+        model="fa-zh",
         device=device_str,
         trust_remote_code=True
     )
